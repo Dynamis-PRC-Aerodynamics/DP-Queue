@@ -1,0 +1,11 @@
+# local configuration: holds the notification topic and tokens
+dpq.conf
+
+# queue state and logs
+state/
+
+# test kit: local settings and reports
+test/test.conf
+test/reports/
+
+__pycache__/

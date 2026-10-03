@@ -1,0 +1,997 @@
+#!/bin/bash
+# dpq - run queue for the Dynamis half-car personal case (OpenFOAM).
+#
+# Runs the queued cases one after the other with the same commands as runAll,
+# checks every step, notifies the machine owner and moves on to the next case
+# when one fails. See README.md for installation and usage.
+
+DPQ_VERSION="1.2"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DPQ_DIR="$(dirname "$SELF")"
+USER="${USER:-$(id -un)}"
+
+# ============================ DEFAULTS ==================================
+# Do not edit here: override any of these in dpq.conf, next to this script.
+FOAM_BASHRC="/usr/lib/openfoam/openfoam2512/etc/bashrc"
+RUN_DIR="$HOME/OpenFOAM/$USER-v2512/run"
+STATE_DIR="$DPQ_DIR/state"
+AEROTOOLS_DIR="$HOME/OpenFOAM/aeroTools"
+MACHINE_NAME="$(hostname)"
+
+NP=""                       # empty: use np from each case's initialConditions
+MPI_OPTS=""                 # extra mpirun options
+MIN_FREE_GB=30              # pause the queue below this free space, 0 disables
+STOP_ON_MESH_CHECK_FAIL=0   # 1: a checkMesh with failed checks stops the case
+LOG_TAIL_LINES=10           # log lines attached to a failure notification
+
+NOTIFY_DESKTOP=1
+TELEGRAM_TOKEN=""
+TELEGRAM_CHAT_ID=""
+NTFY_TOPIC=""
+NTFY_SERVER="https://ntfy.sh"
+MAIL_TO=""
+MAIL_FROM=""
+SMTP_URL="smtps://smtp.gmail.com:465"
+SMTP_USER=""
+SMTP_PASS=""
+# ========================================================================
+
+[ -f "$DPQ_DIR/dpq.conf" ] && source "$DPQ_DIR/dpq.conf"
+
+QUEUE="$STATE_DIR/queue.tsv"            # case path, owner, added (epoch)
+HISTORY="$STATE_DIR/history.tsv"        # end, status, case, owner, seconds, step, reason
+CUR_CASE="$STATE_DIR/current.case"      # case path, owner, start (epoch)
+CUR_STEP="$STATE_DIR/current.step"      # step label, start (epoch), log file
+CUR_PID="$STATE_DIR/current.pid"        # pid of the command of the running step
+WORKER_PID="$STATE_DIR/worker.pid"
+WORKER_LOG="$STATE_DIR/worker.log"
+STOP_FLAG="$STATE_DIR/stop.flag"
+SKIP_FLAG="$STATE_DIR/skip.flag"
+
+# Every step of the pipeline, in order, with the phase it belongs to. The
+# labels are the ones passed to step() in pipeline(): keep the two aligned.
+STEP_PLAN=(
+    "MESH|preProcess"
+    "MESH|surfaceFeatureExtract"
+    "MESH|blockMesh"
+    "MESH|decomposePar (block mesh)"
+    "MESH|checkMesh (block mesh)"
+    "MESH|snappyHexMesh"
+    "MESH|checkMesh"
+    "MESH|reconstructParMesh"
+    "MESH|reconstructPar (mesh fields)"
+    "MESH|patchSummary"
+    "SOLVE|decomposePar"
+    "SOLVE|renumberMesh"
+    "SOLVE|potentialFoam"
+    "SOLVE|simpleFoam"
+    "POST|postProcess (vorticity wallShearStress yPlus)"
+    "POST|postProcess (totalPressureIncompressible)"
+    "POST|postProcess (mag(vorticity))"
+    "POST|generate_surfaces.py"
+    "POST|postProcess (surfaces)"
+    "POST|reconstructPar"
+    "POST|reconstructPar (phi)"
+    "POST|final check"
+)
+MAX_BODY=3500               # notification body limit (ntfy and Telegram cut at 4096)
+declare -A DONE_STEPS=()    # steps completed in the running case
+declare -A STEP_SECS=()     # and how long each one took
+
+# ============================ HELPERS ===================================
+
+die()  { echo "dpq: $*" >&2; exit 1; }
+warn() { echo "dpq: $*" >&2; }
+log()  { echo "[$(date '+%d %b %H:%M:%S')] $*"; }
+
+init_state() {
+    mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
+    touch "$QUEUE" "$HISTORY"
+}
+
+with_lock() {
+    (
+        flock -w 20 9 || { echo "dpq: cannot lock the queue" >&2; exit 1; }
+        "$@"
+    ) 9>"$STATE_DIR/queue.lock"
+}
+
+fmt_dur() {
+    local s="$1"
+    printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+}
+
+fmt_short() {
+    local s="$1"
+    if [ "$s" -ge 3600 ]; then
+        printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+    else
+        printf '%dm%02ds' $((s / 60)) $((s % 60))
+    fi
+}
+
+fmt_time() { date -d "@$1" '+%d %b %H:%M' 2>/dev/null || echo "?"; }
+
+worker_pid() {
+    local pid
+    [ -f "$WORKER_PID" ] || return 1
+    pid="$(cat "$WORKER_PID" 2>/dev/null)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+    grep -qa "_worker" "/proc/$pid/cmdline" 2>/dev/null || return 1
+    echo "$pid"
+}
+
+kill_tree() {
+    local pid="$1" sig="${2:-TERM}" child
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        kill_tree "$child" "$sig"
+    done
+    kill -"$sig" "$pid" 2>/dev/null
+}
+
+kill_current_step() {
+    local pid
+    [ -f "$CUR_PID" ] || return 0
+    pid="$(cat "$CUR_PID" 2>/dev/null)"
+    [ -n "$pid" ] && kill_tree "$pid" TERM
+}
+
+physical_cores() {
+    local n
+    n="$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
+    [ "${n:-0}" -gt 0 ] 2>/dev/null || n="$(nproc --all)"
+    echo "$n"
+}
+
+free_gb() { df -Pk . | awk 'NR==2 {print int($4 / 1048576)}'; }
+
+# Reads a "key   value;" entry of initialConditions in the current folder
+ic_value() {
+    awk -v k="$1" '$1==k {gsub(/[;\r]/, "", $2); print $2; exit}' initialConditions 2>/dev/null
+}
+
+resolve_case() {
+    local arg="$1" path
+    if [ -d "$arg" ]; then
+        path="$arg"
+    elif [ -d "$RUN_DIR/$arg" ]; then
+        path="$RUN_DIR/$arg"
+    else
+        return 1
+    fi
+    readlink -f "$path"
+}
+
+# Prints what is missing in a case folder, nothing if the structure is fine
+validate_case() {
+    local case="$1" item np
+    for item in initialConditions orig0 system/controlDict system/blockMeshDict \
+                system/snappyHexMeshDict system/decomposeParDict; do
+        [ -e "$case/$item" ] || echo "missing $item"
+    done
+    if [ -f "$case/initialConditions" ]; then
+        np="$(cd "$case" && ic_value np)"
+        [[ "$np" =~ ^[0-9]+$ ]] || echo "np not readable in initialConditions"
+    fi
+}
+
+queue_has() { cut -f1 "$QUEUE" | grep -Fxq "$1"; }
+
+next_case_name() {
+    local next
+    next="$(head -n 1 "$QUEUE" 2>/dev/null | cut -f1)"
+    [ -n "$next" ] && basename "$next"
+}
+
+_append_line() { printf '%s\n' "$1" >> "$QUEUE"; }
+
+_pop_line() {
+    [ -s "$QUEUE" ] || return 1
+    head -n 1 "$QUEUE"
+    sed -i '1d' "$QUEUE"
+}
+
+_push_front() {
+    local tmp="$QUEUE.tmp"
+    { printf '%s\n' "$1"; cat "$QUEUE"; } > "$tmp" && mv "$tmp" "$QUEUE"
+}
+
+_remove_case() {
+    local tmp="$QUEUE.tmp"
+    awk -F'\t' -v c="$1" '$1 != c' "$QUEUE" > "$tmp" && mv "$tmp" "$QUEUE"
+}
+
+# ========================== NOTIFICATIONS ===============================
+
+notify_desktop() {
+    local level="$1" title="$2" body="$3" urgency="normal" bus
+    bus="/run/user/$(id -u)/bus"
+    if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ -S "$bus" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$bus"
+    fi
+    [ "$level" = "fail" ] && urgency="critical"
+    notify-send -u "$urgency" -a dpq "$title" "$body"
+}
+
+notify_telegram() {
+    local title="$2" body="$3"
+    curl -sS -f --max-time 20 -o /dev/null \
+        "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+        --data-urlencode "text=${title}"$'\n'"${body}"
+}
+
+notify_ntfy() {
+    local level="$1" title="$2" body="$3" priority="default" tags="information_source"
+    case "$level" in
+        ok)   tags="white_check_mark" ;;
+        fail) tags="x"; priority="high" ;;
+    esac
+    curl -sS -f --max-time 20 -o /dev/null \
+        -H "Title: $title" -H "Priority: $priority" -H "Tags: $tags" \
+        --data-binary "$body" "${NTFY_SERVER%/}/$NTFY_TOPIC"
+}
+
+notify_mail() {
+    local title="$2" body="$3" msg rc from="${MAIL_FROM:-$SMTP_USER}"
+    msg="$(mktemp)"
+    {
+        printf 'From: dpq <%s>\r\n' "$from"
+        printf 'To: %s\r\n' "$MAIL_TO"
+        printf 'Subject: %s\r\n' "$title"
+        printf 'Date: %s\r\n' "$(date -R)"
+        printf 'Content-Type: text/plain; charset=utf-8\r\n\r\n'
+        printf '%s\n' "$body" | sed 's/$/\r/'
+    } > "$msg"
+    curl -sS --max-time 30 --ssl-reqd --url "$SMTP_URL" --user "$SMTP_USER:$SMTP_PASS" \
+        --mail-from "$from" --mail-rcpt "$MAIL_TO" --upload-file "$msg" > /dev/null
+    rc=$?
+    rm -f "$msg"
+    return $rc
+}
+
+# notify <info|ok|fail> <title> <body>
+# A channel that fails is reported in the log and never stops the queue.
+notify() {
+    local level="$1" title="[$MACHINE_NAME] $2" body="$3" channel
+    log "NOTIFY ($level) $title"
+    for channel in desktop telegram ntfy mail; do
+        case "$channel" in
+            desktop)  [ "$NOTIFY_DESKTOP" = "1" ] && command -v notify-send > /dev/null || continue ;;
+            telegram) [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || continue ;;
+            ntfy)     [ -n "$NTFY_TOPIC" ] || continue ;;
+            mail)     [ -n "$MAIL_TO" ] || continue ;;
+        esac
+        if "notify_$channel" "$level" "$title" "$body" 8>&- 2> "$STATE_DIR/notify.err"; then
+            [ "$NOTIFY_VERBOSE" = "1" ] && echo "  $channel: sent"
+        else
+            log "  $channel notification failed: $(head -c 300 "$STATE_DIR/notify.err" | tr '\n' ' ')"
+        fi
+    done
+    return 0
+}
+
+# ============================ PIPELINE ==================================
+
+# step <log file> <label> <End required: 0|1> <command...>
+# Runs one command of the pipeline and decides whether it succeeded:
+# exit code 0, no FOAM FATAL ERROR in the log and, where required, the final
+# "End" line. On failure FAILED_STEP, FAIL_REASON and FAIL_LOG are set.
+step() {
+    local logfile="$1" label="$2" need_end="$3" pid rc reason="" started
+    shift 3
+
+    FAILED_STEP="$label"
+    FAIL_LOG="$PWD/$logfile"
+    if [ -e "$SKIP_FLAG" ] || [ "$TERM_REQUESTED" = "1" ]; then
+        FAIL_REASON="stopped before this step"
+        FAIL_LOG=""
+        return 1
+    fi
+
+    started="$(date +%s)"
+    printf '%s\t%s\t%s\n' "$label" "$started" "$PWD/$logfile" > "$CUR_STEP"
+    log "  [$CASE_NAME] $label"
+
+    "$@" > "$logfile" 2>&1 < /dev/null 8>&- &
+    pid=$!
+    echo "$pid" > "$CUR_PID"
+    wait "$pid"
+    rc=$?
+    if [ "$TERM_REQUESTED" = "1" ]; then
+        kill_tree "$pid" TERM
+        wait "$pid" 2> /dev/null
+    fi
+    rm -f "$CUR_PID"
+
+    if [ -e "$SKIP_FLAG" ] || [ "$TERM_REQUESTED" = "1" ]; then
+        reason="stopped while running"
+    elif grep -Eq "FOAM FATAL (IO )?ERROR" "$logfile"; then
+        reason="FOAM FATAL ERROR in the log (exit code $rc)"
+    elif [ "$rc" -ne 0 ]; then
+        reason="exit code $rc"
+    elif [ "$need_end" = "1" ] && ! tail -n 30 "$logfile" | grep -qx "End"; then
+        reason="the log does not finish with 'End'"
+    fi
+
+    if [ -n "$reason" ]; then
+        FAIL_REASON="$reason"
+        return 1
+    fi
+    DONE_STEPS["$label"]=1
+    STEP_SECS["$label"]=$(( $(date +%s) - started ))
+    FAILED_STEP=""
+    FAIL_LOG=""
+    return 0
+}
+
+# The plan of the running case: preProcess is left out when the case has no
+# runPreProcess. Must be called from the case folder.
+case_plan() {
+    local entry
+    for entry in "${STEP_PLAN[@]}"; do
+        [ "$entry" = "MESH|preProcess" ] && [ ! -f runPreProcess ] && continue
+        echo "$entry"
+    done
+}
+
+# One line per step, grouped by phase: done, failed or not run
+step_checklist() {
+    local entry phase label last="" secs
+    while IFS= read -r entry; do
+        phase="${entry%%|*}"
+        label="${entry#*|}"
+        if [ "$phase" != "$last" ]; then
+            echo "$phase"
+            last="$phase"
+        fi
+        secs="${STEP_SECS[$label]:-0}"
+        if [ "$label" = "$FAILED_STEP" ]; then
+            echo "✗ $label"
+        elif [ -n "${DONE_STEPS[$label]}" ]; then
+            if [ "$secs" -ge 60 ]; then
+                echo "✓ $label ($(fmt_short "$secs"))"
+            else
+                echo "✓ $label"
+            fi
+        else
+            echo "· $label"
+        fi
+    done < <(case_plan)
+}
+
+# What to show of the log of a failed step: the FOAM error message if there is
+# one (the end of a parallel log is only mpirun reporting the abort), the last
+# lines otherwise. Prints a title line first.
+log_excerpt() {
+    local file="$1" budget="$2" line
+    line="$(grep -n -m 1 -E "FOAM FATAL (IO )?ERROR" "$file" | cut -d: -f1)"
+    if [ -n "$line" ]; then
+        echo "--- error in the log (line $line) ---"
+        tail -n "+$line" "$file" | head -n "$LOG_TAIL_LINES" | cut -c1-160 | head -c "$budget"
+    else
+        echo "--- end of the log ---"
+        tail -n "$LOG_TAIL_LINES" "$file" | cut -c1-160 | tail -c "$budget"
+    fi
+}
+
+# "6 of 22" for the failed step, empty if the failure is not a step of the plan
+step_position() {
+    local entry n=0 total found=""
+    total="$(case_plan | wc -l)"
+    while IFS= read -r entry; do
+        n=$((n + 1))
+        [ "${entry#*|}" = "$FAILED_STEP" ] && found="$n"
+    done < <(case_plan)
+    [ -n "$found" ] && echo "$found of $total"
+}
+
+# "mesh 5m02s, solve 0m40s, post 0m12s" from the time spent in the steps
+phase_times() {
+    local entry phase label mesh=0 solve=0 post=0
+    while IFS= read -r entry; do
+        phase="${entry%%|*}"
+        label="${entry#*|}"
+        case "$phase" in
+            MESH)  mesh=$((mesh + ${STEP_SECS[$label]:-0})) ;;
+            SOLVE) solve=$((solve + ${STEP_SECS[$label]:-0})) ;;
+            POST)  post=$((post + ${STEP_SECS[$label]:-0})) ;;
+        esac
+    done < <(case_plan)
+    echo "mesh $(fmt_short "$mesh"), solve $(fmt_short "$solve"), post $(fmt_short "$post")"
+}
+
+mesh_checks() {
+    local failed illegal
+    failed="$(grep -Eo "Failed [0-9]+ mesh checks" log_mesh/06_checkMesh | tail -n 1)"
+    illegal="$(grep -Eo "Finished meshing with [0-9]+ illegal faces" log_mesh/05_snappyHexMesh | tail -n 1)"
+    [ -n "$illegal" ] && WARNINGS+=("snappyHexMesh: ${illegal#Finished meshing with }")
+    if [ -n "$failed" ]; then
+        if [ "$STOP_ON_MESH_CHECK_FAIL" = "1" ]; then
+            FAILED_STEP="checkMesh"
+            FAIL_REASON="$failed (STOP_ON_MESH_CHECK_FAIL=1)"
+            FAIL_LOG="$PWD/log_mesh/06_checkMesh"
+            return 1
+        fi
+        WARNINGS+=("checkMesh: $failed")
+    fi
+    return 0
+}
+
+# Final check on what the run left in the case folder
+verify_results() {
+    local latest last target missing
+    latest="$(ls -d [0-9]* 2> /dev/null | grep -E '^[0-9]+(\.[0-9]+)?$' | sort -g | tail -n 1)"
+    FAILED_STEP="final check"
+    FAIL_LOG=""
+    if [ -z "$latest" ] || [ "$latest" = "0" ]; then
+        FAIL_REASON="no reconstructed time folder after the run"
+        return 1
+    fi
+    if ! ls "$latest"/U* > /dev/null 2>&1 || ! ls "$latest"/p* > /dev/null 2>&1; then
+        FAIL_REASON="U or p missing in time folder $latest"
+        return 1
+    fi
+    if [ -z "$(ls -A postProcessing 2> /dev/null)" ]; then
+        FAIL_REASON="postProcessing folder missing or empty"
+        return 1
+    fi
+    FAILED_STEP=""
+    DONE_STEPS["final check"]=1
+    missing="$(grep -Eho 'Could not load "[^"]+"' log_solve/04_simpleFoam | sort -u | cut -d'"' -f2 | tr '\n' ' ')"
+    [ -n "$missing" ] && WARNINGS+=("simpleFoam could not load: ${missing% }")
+    last="$(grep -E '^Time = ' log_solve/04_simpleFoam | tail -n 1 | awk '{print $3}')"
+    target="$(ic_value iterations)"
+    RESULT_NOTE="iterations: ${last:-?}/${target:-?}"
+    if grep -q "solution converged" log_solve/04_simpleFoam; then
+        RESULT_NOTE="$RESULT_NOTE (converged by residualControl)"
+    fi
+    return 0
+}
+
+# Same commands and same log names as runAll, without the two questions
+pipeline() {
+    local np="$1"
+    local mpi=(mpirun -np "$np" $MPI_OPTS)
+
+    # ---------------------------- mesh ----------------------------------
+    rm -fr extendedFeature* trisurface/*.eMesh log_mesh processor* allProcessors allProcessors_mesh
+    rm -fr constant/polyMesh dynamicCode 0
+    mkdir -p log_mesh
+    cp -r orig0 0
+
+    if [ -f runPreProcess ]; then
+        step log_mesh/00_preProcess "preProcess" 0 bash ./runPreProcess || return 1
+    fi
+    step log_mesh/01_surfaceFeatures "surfaceFeatureExtract" 0 \
+        surfaceFeatureExtract || return 1
+    step log_mesh/02_blockMesh "blockMesh" 0 \
+        blockMesh || return 1
+    step log_mesh/03_decomposeParBlock "decomposePar (block mesh)" 0 \
+        decomposePar -force -latestTime || return 1
+    step log_mesh/04_checkMeshBlock "checkMesh (block mesh)" 0 \
+        "${mpi[@]}" checkMesh -allTopology -allGeometry -parallel || return 1
+    step log_mesh/05_snappyHexMesh "snappyHexMesh" 1 \
+        "${mpi[@]}" snappyHexMesh -overwrite -parallel || return 1
+    step log_mesh/06_checkMesh "checkMesh" 0 \
+        "${mpi[@]}" checkMesh -allTopology -allGeometry -parallel || return 1
+    mesh_checks || return 1
+    step log_mesh/07_reconstructParMesh "reconstructParMesh" 0 \
+        reconstructParMesh -constant -fullMatch -mergeTol 1e-10 || return 1
+    step log_mesh/08_reconstructParBC "reconstructPar (mesh fields)" 0 \
+        reconstructPar -constant -withZero \
+        -fields '(cellLevel pointLevel nSurfaceLayers thickness thicknessFraction)' || return 1
+    step log_mesh/09_patchSummary "patchSummary" 0 \
+        patchSummary || return 1
+
+    rm -fr Mesh
+    mkdir Mesh
+    cp -r 0 Mesh
+    mkdir allProcessors_mesh
+    mv processor* ./allProcessors_mesh
+    rm -fr dynamicCode
+
+    # ---------------------------- solve ---------------------------------
+    rm -fr [0-9]*
+    rm -fr processor* log_solve postProcessing VTK
+    cp -r orig0 ./0
+    mkdir log_solve
+
+    step log_solve/01_decomposePar "decomposePar" 0 \
+        decomposePar || return 1
+    step log_solve/02_renumberMesh "renumberMesh" 0 \
+        "${mpi[@]}" renumberMesh -overwrite -latestTime -parallel || return 1
+    step log_solve/03_potentialFoam "potentialFoam" 1 \
+        "${mpi[@]}" potentialFoam -parallel || return 1
+    step log_solve/04_simpleFoam "simpleFoam" 1 \
+        "${mpi[@]}" simpleFoam -parallel || return 1
+    SOLVER_DONE=1
+
+    # ------------------------- post-processing --------------------------
+    step log_solve/06_functionObjects "postProcess (vorticity wallShearStress yPlus)" 0 \
+        "${mpi[@]}" simpleFoam -postProcess -funcs "(vorticity wallShearStress yPlus)" \
+        -latestTime -parallel || return 1
+    step log_solve/07_totalPressureIncompressible "postProcess (totalPressureIncompressible)" 0 \
+        "${mpi[@]}" postProcess -func "totalPressureIncompressible(p,U,rhoInf=1.225)" \
+        -latestTime -parallel || return 1
+    step log_solve/08_magVorticity "postProcess (mag(vorticity))" 0 \
+        "${mpi[@]}" postProcess -func "mag(vorticity)" -latestTime -parallel || return 1
+
+    if [ -f postProcessor/generate_surfaces.py ]; then
+        step log_solve/08b_generateSurfaces "generate_surfaces.py" 0 \
+            python3 postProcessor/generate_surfaces.py || return 1
+    elif [ -f "$AEROTOOLS_DIR/generate_surfaces.py" ]; then
+        step log_solve/08b_generateSurfaces "generate_surfaces.py" 0 \
+            python3 "$AEROTOOLS_DIR/generate_surfaces.py" "$PWD" || return 1
+    else
+        FAILED_STEP="generate_surfaces.py"
+        FAIL_REASON="script not found in postProcessor/ nor in $AEROTOOLS_DIR"
+        return 1
+    fi
+
+    step log_solve/09_surfaces "postProcess (surfaces)" 0 \
+        "${mpi[@]}" simpleFoam -postProcess -dict system/controlDict_surfaces \
+        -latestTime -parallel || return 1
+    step log_solve/10_reconstructPar "reconstructPar" 0 \
+        reconstructPar -latestTime || return 1
+    step log_solve/11_reconstructPar0 "reconstructPar (phi)" 0 \
+        reconstructPar -withZero -fields '(phi)' -latestTime || return 1
+
+    mkdir allProcessors
+    mv processor* ./allProcessors
+    return 0
+}
+
+# ============================= WORKER ===================================
+
+record_history() {
+    # status, case, owner, seconds, step, reason
+    # empty fields are written as "-": consecutive tabs would collapse on reading
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "${3:--}" "$4" "${5:--}" "${6:--}" >> "$HISTORY"
+}
+
+clear_current() { rm -f "$CUR_CASE" "$CUR_STEP" "$CUR_PID"; }
+
+# A case left in current.case means the previous worker died half way
+recover_interrupted() {
+    local case owner start pid
+    [ -f "$CUR_CASE" ] || return 0
+    IFS=$'\t' read -r case owner start < "$CUR_CASE"
+    pid="$(cat "$CUR_PID" 2> /dev/null)"
+    if [ -n "$pid" ] && [ "$(readlink "/proc/$pid/cwd" 2> /dev/null)" = "$case" ]; then
+        log "killing the command left behind by the previous worker (pid $pid)"
+        kill_tree "$pid" TERM
+    fi
+    record_history INTERRUPTED "$case" "$owner" 0 "$(cut -f1 "$CUR_STEP" 2> /dev/null)" "worker died"
+    notify fail "dpq: INTERRUPTED $(basename "$case")" \
+        "The previous queue worker died while running this case (reboot or kill).
+The case was not restarted: add it again with 'dpq add' if needed.
+Case: $case"
+    clear_current
+}
+
+# Prints why the case in the current folder cannot start, nothing if it can.
+# mpirun gives one slot per physical core, one per hardware thread with
+# --use-hwthread-cpus, and any number with --oversubscribe.
+precheck() {
+    local np="$1" cores threads
+    cores="$(physical_cores)"
+    threads="$(nproc --all)"
+    if ! [[ "$np" =~ ^[0-9]+$ ]] || [ "$np" -lt 1 ]; then
+        echo "np not readable in initialConditions"
+    elif [[ "$MPI_OPTS" == *use-hwthread-cpus* ]] && [ "$np" -gt "$threads" ] \
+            && [[ "$MPI_OPTS" != *oversubscribe* ]]; then
+        echo "np = $np but this machine has $threads hardware threads"
+    elif [[ "$MPI_OPTS" != *use-hwthread-cpus* ]] && [ "$np" -gt "$cores" ] \
+            && [[ "$MPI_OPTS" != *oversubscribe* ]]; then
+        echo "np = $np but this machine has $cores physical cores"
+    elif [ ! -d orig0 ]; then
+        echo "orig0 folder missing"
+    elif [ -n "$(find constant/triSurface_0deg -maxdepth 1 -type l 2> /dev/null | head -n 1)" ]; then
+        echo "symbolic links in constant/triSurface_0deg: the pre-processor would overwrite the files they point to"
+    elif [ -f runPreProcess ] && grep -q $'\r' runPreProcess; then
+        echo "Windows line endings (CRLF) in the case scripts: convert them with dos2unix"
+    fi
+}
+
+run_case() {
+    local case="$1" owner="$2"
+    local t0 np case_np free next elapsed status body tail_text warning
+    local position word budget
+    t0="$(date +%s)"
+    CASE_NAME="$(basename "$case")"
+    WARNINGS=()
+    FAILED_STEP=""; FAIL_REASON=""; FAIL_LOG=""; RESULT_NOTE=""; SOLVER_DONE=0
+    DONE_STEPS=()
+    STEP_SECS=()
+    PAUSE_QUEUE=0
+
+    printf '%s\t%s\t%s\n' "$case" "$owner" "$t0" > "$CUR_CASE"
+    rm -f "$CUR_STEP" "$SKIP_FLAG"
+
+    if ! cd "$case" 2> /dev/null; then
+        record_history FAILED "$case" "$owner" 0 "pre-check" "case folder not found"
+        notify fail "dpq: FAILED $CASE_NAME" "Case folder not found: $case"
+        clear_current
+        return 1
+    fi
+
+    free="$(free_gb)"
+    if [ "$MIN_FREE_GB" -gt 0 ] && [ "${free:-0}" -lt "$MIN_FREE_GB" ]; then
+        with_lock _push_front "$(printf '%s\t%s\t%s' "$case" "$owner" "$t0")"
+        notify fail "dpq: queue PAUSED, disk almost full" \
+            "Free space: ${free} GB, minimum required: ${MIN_FREE_GB} GB.
+$CASE_NAME is still first in the queue. Free some space and run 'dpq start'."
+        clear_current
+        PAUSE_QUEUE=1
+        return 1
+    fi
+
+    case_np="$(ic_value np)"
+    np="$case_np"
+    if [ -n "$NP" ] && [ "$NP" != "$case_np" ]; then
+        sed -i -E "s/^(np[[:space:]]+)[0-9]+/\1${NP}/" initialConditions
+        np="$(ic_value np)"
+        WARNINGS+=("np changed from $case_np to $np in initialConditions")
+    fi
+    FAIL_REASON="$(precheck "$np")"
+    [ -n "$FAIL_REASON" ] && FAILED_STEP="pre-check"
+
+    if [ -z "$FAILED_STEP" ]; then
+        next="$(next_case_name)"
+        notify info "dpq: started $CASE_NAME" \
+            "Owner: $owner
+Cores: $np
+Started: $(date '+%d %b %H:%M')
+Still in queue: $(wc -l < "$QUEUE")${next:+ (next: $next)}"
+        pipeline "$np" && verify_results
+    fi
+
+    elapsed=$(( $(date +%s) - t0 ))
+    next="$(next_case_name)"
+
+    for warning in "${WARNINGS[@]}"; do
+        log "  [$CASE_NAME] warning: $warning"
+    done
+
+    if [ -z "$FAILED_STEP" ]; then
+        status="OK"
+        record_history OK "$case" "$owner" "$elapsed" "" "$RESULT_NOTE"
+        body="Owner: $owner
+Duration: $(fmt_short "$elapsed") ($(phase_times))
+Result: all $(case_plan | wc -l) steps done, $RESULT_NOTE"
+        [ ${#WARNINGS[@]} -gt 0 ] && body="$body
+Warnings:$(printf '\n - %s' "${WARNINGS[@]}")"
+        body="$body
+Next: ${next:-queue empty}"
+        notify ok "dpq: DONE $CASE_NAME" "$body"
+    else
+        status="FAILED"
+        [ -e "$SKIP_FLAG" ] && status="SKIPPED"
+        [ "$TERM_REQUESTED" = "1" ] && status="INTERRUPTED"
+        record_history "$status" "$case" "$owner" "$elapsed" "$FAILED_STEP" "$FAIL_REASON"
+        word="failed"
+        [ "$status" = "FAILED" ] || word="stopped"
+        position="$(step_position)"
+        body="Owner: $owner"
+        if [ -n "$position" ]; then
+            body="$body
+${word^} at: $FAILED_STEP (step $position) after $(fmt_short "$elapsed")
+Reason: $FAIL_REASON"
+        else
+            body="$body
+Stopped at the $FAILED_STEP, no step was run
+Reason: $FAIL_REASON"
+        fi
+        [ "$SOLVER_DONE" = "1" ] && body="$body
+The solver had finished: fix the problem and run ./runPostProcess in the case."
+        [ ${#WARNINGS[@]} -gt 0 ] && body="$body
+Warnings:$(printf '\n - %s' "${WARNINGS[@]}")"
+        body="$body
+Next: ${next:-queue empty}"
+        if [ -n "$position" ]; then
+            body="$body
+
+✓ done   ✗ $word   · not run
+$(step_checklist)"
+        fi
+        if [ -n "$FAIL_LOG" ] && [ -f "$FAIL_LOG" ]; then
+            body="$body
+
+Log: $FAIL_LOG"
+            budget=$(( MAX_BODY - ${#body} - 60 ))
+            if [ "$budget" -gt 200 ]; then
+                tail_text="$(log_excerpt "$FAIL_LOG" "$budget")"
+                body="$body
+$tail_text"
+            fi
+        fi
+        notify fail "dpq: $status $CASE_NAME" "$body"
+    fi
+
+    SESSION_RESULTS+=("$status  $CASE_NAME${FAILED_STEP:+  ($FAILED_STEP)}")
+    rm -f "$SKIP_FLAG"
+    clear_current
+    cd "$STATE_DIR" || true
+    [ "$status" = "OK" ]
+}
+
+load_openfoam() {
+    source "$FOAM_BASHRC"
+}
+
+on_term() {
+    TERM_REQUESTED=1
+    kill_current_step
+}
+
+cmd_worker() {
+    local line case owner added
+    init_state
+    exec 8> "$STATE_DIR/worker.lock"
+    flock -n 8 || die "another worker is already running"
+    echo $$ > "$WORKER_PID"
+    trap 'rm -f "$WORKER_PID"' EXIT
+    trap on_term TERM INT HUP
+
+    TERM_REQUESTED=0
+    SESSION_RESULTS=()
+    log "worker started (pid $$, dpq $DPQ_VERSION)"
+
+    [ -f "$FOAM_BASHRC" ] || die "OpenFOAM bashrc not found: $FOAM_BASHRC"
+    load_openfoam
+    command -v simpleFoam > /dev/null || die "simpleFoam not found after sourcing $FOAM_BASHRC"
+
+    recover_interrupted
+
+    while :; do
+        if [ "$TERM_REQUESTED" = "1" ]; then
+            log "worker terminated"
+            break
+        fi
+        if [ -e "$STOP_FLAG" ]; then
+            rm -f "$STOP_FLAG"
+            notify info "dpq: queue stopped" \
+                "Stopped on request. Still in queue: $(wc -l < "$QUEUE").
+$(printf '%s\n' "${SESSION_RESULTS[@]}")"
+            break
+        fi
+        if ! line="$(with_lock _pop_line)"; then
+            notify info "dpq: queue finished" \
+                "No more cases to run.
+$(printf '%s\n' "${SESSION_RESULTS[@]}")"
+            break
+        fi
+        IFS=$'\t' read -r case owner added <<< "$line"
+        run_case "$case" "$owner"
+        [ "$PAUSE_QUEUE" = "1" ] && break
+    done
+    log "worker finished"
+}
+
+# ============================ COMMANDS ==================================
+
+cmd_add() {
+    local owner="${DPQ_OWNER:-$USER}" args=() arg path problems rc=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--owner) owner="$2"; shift 2 ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ ${#args[@]} -gt 0 ] || die "usage: dpq add [-o owner] <case> [<case> ...]"
+    owner="${owner//$'\t'/ }"
+    [ -n "$owner" ] || owner="-"
+
+    for arg in "${args[@]}"; do
+        if ! path="$(resolve_case "$arg")"; then
+            warn "case not found: $arg (looked in the current folder and in $RUN_DIR)"
+            rc=1; continue
+        fi
+        if [[ "$path" == *$'\t'* ]]; then
+            warn "tab character in the path, not added: $path"
+            rc=1; continue
+        fi
+        problems="$(validate_case "$path")"
+        if [ -n "$problems" ]; then
+            warn "not a half-car personal case, not added: $path"
+            echo "$problems" | sed 's/^/       /' >&2
+            rc=1; continue
+        fi
+        if queue_has "$path" || [ "$(cut -f1 "$CUR_CASE" 2> /dev/null)" = "$path" ]; then
+            warn "already queued or running, not added: $path"
+            rc=1; continue
+        fi
+        with_lock _append_line "$(printf '%s\t%s\t%s' "$path" "$owner" "$(date +%s)")"
+        echo "added: $(basename "$path")  (owner: $owner, position $(wc -l < "$QUEUE"))"
+        if [ -d "$path/log_solve" ] || [ -d "$path/allProcessors" ] || [ -d "$path/constant/polyMesh" ]; then
+            echo "  WARNING: this case already holds a mesh or results. The queue will delete them."
+        fi
+    done
+
+    if ! worker_pid > /dev/null; then
+        echo "The queue is not running: start it with 'dpq start'."
+    fi
+    return $rc
+}
+
+cmd_remove() {
+    local arg path
+    [ $# -gt 0 ] || die "usage: dpq remove <case name | queue position> [...]"
+    for arg in "$@"; do
+        if [[ "$arg" =~ ^[0-9]+$ ]]; then
+            path="$(sed -n "${arg}p" "$QUEUE" | cut -f1)"
+        else
+            path="$(cut -f1 "$QUEUE" | awk -v n="$arg" '{m=$0; sub(/.*\//, "", m)} m==n || $0==n {print; exit}')"
+        fi
+        if [ -z "$path" ]; then
+            warn "not in the queue: $arg"
+            continue
+        fi
+        with_lock _remove_case "$path"
+        echo "removed: $(basename "$path")"
+    done
+}
+
+print_queue() {
+    local n=0 case owner added
+    if [ ! -s "$QUEUE" ]; then
+        echo "Queue: empty"
+        return
+    fi
+    echo "Queue ($(wc -l < "$QUEUE")):"
+    while IFS=$'\t' read -r case owner added; do
+        n=$((n + 1))
+        printf '  %2d. %-32s owner: %-12s added: %s\n' "$n" "$(basename "$case")" "$owner" "$(fmt_time "$added")"
+    done < "$QUEUE"
+}
+
+cmd_status() {
+    local pid case owner start label step_start logfile now iter target
+    now="$(date +%s)"
+    if pid="$(worker_pid)"; then
+        echo "Worker: running (pid $pid)"
+        [ -e "$STOP_FLAG" ] && echo "        will stop after the current case"
+    else
+        echo "Worker: not running"
+    fi
+
+    if [ -f "$CUR_CASE" ]; then
+        IFS=$'\t' read -r case owner start < "$CUR_CASE"
+        echo "Running: $(basename "$case")  (owner: $owner, since $(fmt_time "$start"), $(fmt_dur $((now - start))))"
+        echo "         $case"
+        if [ -f "$CUR_STEP" ]; then
+            IFS=$'\t' read -r label step_start logfile < "$CUR_STEP"
+            echo "Step:    $label  ($(fmt_dur $((now - step_start))))"
+            if [ "$label" = "simpleFoam" ] && [ -f "$logfile" ]; then
+                iter="$(grep -E '^Time = ' "$logfile" | tail -n 1 | awk '{print $3}')"
+                target="$(cd "$case" && ic_value iterations)"
+                echo "         iteration ${iter:-0}/${target:-?}"
+            fi
+        fi
+        worker_pid > /dev/null || echo "         (stale: no worker is alive, the next 'dpq start' will report it)"
+    else
+        echo "Running: nothing"
+    fi
+    print_queue
+}
+
+cmd_history() {
+    local n="${1:-15}" end status case owner secs stepname reason
+    [ -s "$HISTORY" ] || { echo "History: empty"; return; }
+    tail -n "$n" "$HISTORY" | while IFS=$'\t' read -r end status case owner secs stepname reason; do
+        [ "$stepname" = "-" ] && stepname=""
+        printf '%s  %-11s %-28s %-10s %7s  %s\n' "$(fmt_time "$end")" "$status" "$(basename "$case")" \
+            "$owner" "$(fmt_dur "$secs")" "${stepname:+$stepname: }$reason"
+    done
+}
+
+cmd_start() {
+    worker_pid > /dev/null && die "the queue is already running (see 'dpq status')"
+    [ -f "$FOAM_BASHRC" ] || die "OpenFOAM bashrc not found: $FOAM_BASHRC (set FOAM_BASHRC in dpq.conf)"
+    [ -s "$QUEUE" ] || die "the queue is empty: add a case first with 'dpq add'"
+    rm -f "$STOP_FLAG" "$SKIP_FLAG"
+    if [ "$1" = "--foreground" ]; then
+        bash "$SELF" _worker 2>&1 | tee -ai "$WORKER_LOG"
+        return
+    fi
+    nohup setsid bash "$SELF" _worker >> "$WORKER_LOG" 2>&1 < /dev/null &
+    sleep 1
+    if worker_pid > /dev/null; then
+        if grep -qi microsoft /proc/version 2> /dev/null; then
+            echo "Queue started (pid $(worker_pid)). On WSL keep one terminal open while it runs."
+        else
+            echo "Queue started (pid $(worker_pid)). It keeps running after you close this terminal."
+        fi
+        echo "Follow it with 'dpq status' or 'dpq log'."
+    else
+        echo "The worker did not stay alive. Last lines of $WORKER_LOG:" >&2
+        tail -n 5 "$WORKER_LOG" >&2
+        exit 1
+    fi
+}
+
+cmd_stop() {
+    worker_pid > /dev/null || die "the queue is not running"
+    touch "$STOP_FLAG"
+    echo "The queue will stop when the current case is over. Queued cases stay in the queue."
+}
+
+cmd_skip() {
+    [ -f "$CUR_CASE" ] && worker_pid > /dev/null || die "nothing is running"
+    touch "$SKIP_FLAG"
+    kill_current_step
+    echo "Stopping $(basename "$(cut -f1 "$CUR_CASE")"): the queue moves on to the next case."
+}
+
+cmd_abort() {
+    worker_pid > /dev/null || die "the queue is not running"
+    touch "$STOP_FLAG" "$SKIP_FLAG"
+    kill_current_step
+    echo "Current case stopped and queue halted. Queued cases stay in the queue."
+}
+
+cmd_log() {
+    [ -f "$WORKER_LOG" ] || die "no log yet"
+    if [ "$1" = "-f" ]; then
+        tail -n 30 -f "$WORKER_LOG"
+    else
+        tail -n "${1:-30}" "$WORKER_LOG"
+    fi
+}
+
+cmd_test_notify() {
+    NOTIFY_VERBOSE=1
+    notify info "dpq: test notification" "If you can read this, the channel works.
+Sent on $(date '+%d %b %H:%M') by $USER."
+    if [ "$NOTIFY_DESKTOP" = "1" ] && ! command -v notify-send > /dev/null; then
+        echo "  desktop: notify-send is not installed (sudo apt install libnotify-bin)"
+    fi
+    echo "Channels that are not listed above are not configured in dpq.conf."
+}
+
+usage() {
+    cat << EOF
+dpq $DPQ_VERSION - run queue for the Dynamis half-car personal case
+
+  dpq add [-o owner] <case> [...]   queue one or more cases (name inside
+                                    $RUN_DIR, or a path)
+  dpq start [--foreground]          start running the queue
+  dpq status                        what is running, at which step, and the queue
+  dpq remove <name | position>      take a case out of the queue
+  dpq skip                          stop the running case, go on with the next one
+  dpq stop                          stop the queue after the running case
+  dpq abort                         stop the running case and the queue now
+  dpq history [N]                   last N finished cases (default 15)
+  dpq log [-f | N]                  queue log
+  dpq test-notify                   send a test message on every configured channel
+
+Configuration: $DPQ_DIR/dpq.conf
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        help|-h|--help) usage; return ;;
+        version|-v|--version) echo "dpq $DPQ_VERSION"; return ;;
+    esac
+    init_state
+    case "$cmd" in
+        add)            cmd_add "$@" ;;
+        remove|rm)      cmd_remove "$@" ;;
+        status|st|list|ls) cmd_status ;;
+        start)          cmd_start "$@" ;;
+        stop)           cmd_stop ;;
+        skip)           cmd_skip ;;
+        abort)          cmd_abort ;;
+        history)        cmd_history "$@" ;;
+        log)            cmd_log "$@" ;;
+        test-notify)    cmd_test_notify ;;
+        _worker)        cmd_worker ;;
+        *)              usage; exit 1 ;;
+    esac
+}
+
+main "$@"

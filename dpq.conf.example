@@ -1,0 +1,42 @@
+# dpq configuration. Copy this file to dpq.conf (install.sh does it) and edit
+# the copy: dpq.conf is not tracked by git, so tokens and topic names stay on
+# this machine. Bash syntax: KEY="value", no spaces around "=".
+
+# ----------------------------- machine ----------------------------------
+FOAM_BASHRC="/usr/lib/openfoam/openfoam2512/etc/bashrc"
+RUN_DIR="$HOME/OpenFOAM/$USER-v2512/run"      # where 'dpq add <name>' looks for cases
+AEROTOOLS_DIR="$HOME/OpenFOAM/aeroTools"      # used by cases without postProcessor/
+MACHINE_NAME="$(hostname)"                    # shown in every notification
+
+# Cores for every run. Empty: each case keeps the np of its initialConditions.
+# A number: the np line of initialConditions is rewritten before the run.
+NP=""
+
+# Extra mpirun options. "--use-hwthread-cpus" allows one process per hardware
+# thread instead of one per physical core.
+MPI_OPTS=""
+
+MIN_FREE_GB=30              # the queue pauses below this free disk space, 0 disables
+STOP_ON_MESH_CHECK_FAIL=0   # 1: a final checkMesh with failed checks stops the case
+
+# --------------------------- notifications ------------------------------
+# Check them with:  dpq test-notify
+
+# Pop-up on the desktop of this machine
+NOTIFY_DESKTOP=1
+
+# Telegram: token from @BotFather, chat id of the person or group to notify
+TELEGRAM_TOKEN=""
+TELEGRAM_CHAT_ID=""
+
+# ntfy push notifications. The topic name works like a password: anyone who
+# knows it can read the messages. install.sh writes a random one here.
+NTFY_TOPIC=""
+NTFY_SERVER="https://ntfy.sh"
+
+# E-mail through an SMTP account (Gmail needs an "app password")
+MAIL_TO=""
+MAIL_FROM=""                # empty: same as SMTP_USER
+SMTP_URL="smtps://smtp.gmail.com:465"
+SMTP_USER=""
+SMTP_PASS=""

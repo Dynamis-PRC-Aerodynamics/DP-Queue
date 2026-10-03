@@ -1,0 +1,18 @@
+# Settings of the dpq test (run_test.sh). Copy this file to test.conf and fill
+# it in: test.conf is not tracked by git. Bash syntax: KEY="value".
+
+# Half-car personal case to copy the structure from (scripts, system/, orig0/...)
+TEMPLATE="/path/to/DP-case-half-car-personal-case"
+
+# Folder with the .obj files that go into constant/triSurface_0deg
+GEOMETRY="/path/to/a/case/constant/triSurface_0deg"
+
+# ntfy topic that receives the notifications of the test. Subscribe to this
+# same name in the ntfy app before starting. Empty: no notifications.
+NTFY_TOPIC=""
+
+# Uncomment to change the defaults
+#FOAM_BASHRC="/usr/lib/openfoam/openfoam2512/etc/bashrc"
+#WORK="$HOME/dpq_test"
+#ITERATIONS=30
+#COARSEN=3

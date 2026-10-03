@@ -1,0 +1,2 @@
+# Bash refuses scripts with Windows line endings: keep LF on every system
+* text=auto eol=lf
