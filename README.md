@@ -55,8 +55,8 @@ Messages sent:
 A failure looks like this. Every step of the run is listed with its outcome, so the point where it stopped is visible at a glance:
 
 ```
-[PC-name] dpq: FAILED DP18_RH30
-Owner: Mario
+[PC-name] dpq: FAILED DP18_W30
+Owner: Beppe_Brescia
 Failed at: snappyHexMesh (step 6 of 22) after 4m12s
 Reason: FOAM FATAL ERROR in the log (exit code 1)
 Next: DP18_RH35
@@ -88,7 +88,7 @@ POST
 · reconstructPar (phi)
 · final check
 
-Log: /home/.../DP18_RH30/log_mesh/05_snappyHexMesh
+Log: /home/.../DP18_W30/log_mesh/05_snappyHexMesh
 --- end of the log ---
 (last lines of that log)
 ```
@@ -106,8 +106,8 @@ A channel that fails is written in the queue log and never stops the queue. Only
 ## Use
 
 ```bash
-dpq add DP18_RH30 DP18_RH35     # cases inside run/, or any path
-dpq add -o Mario DP18_RH40      # -o: who the run belongs to, shown in the notifications
+dpq add DP18_W30 DP18_W35     # cases inside run/, or any path
+dpq add -o Beppe_Brescia DP18_W40      # -o: who the run belongs to, shown in the notifications
 dpq start                       # start the queue
 dpq status                      # running case, current step, iteration, queue
 ```
